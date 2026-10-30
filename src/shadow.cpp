@@ -1,3 +1,6 @@
+// Modified 2026-10-30 by cwozycz-sudo: Resume animation pose searches under a shared per-frame budget.
+// Community changes distributed under the upstream GNU GPL v3; see LICENSE.
+#include "pose_search.h"
 // shadow: a depth map of the world as the sun sees it, kept by a cache of casters.
 //
 // Volumetric light asks, for any point in the air: does the sun reach it? That needs the scene's depth
@@ -693,6 +696,10 @@ namespace
         unsigned rng = 0x9E3779B9u;
         std::vector<Obs> prevObs;        // the last drawn frame's, to tell a slow turn from a fast one
         double   prevAt = -1.0, searchedAt = -1.0;
+        PoseSearch search;
+        std::vector<Obs> searchObs, searchPrevObs;
+        double searchAt = 0.0, searchPreviousAt = 0.0;
+        const M2Anim* searchModel = nullptr;
         float    syncErr = -1.0f;        // the probe: the last match's error, matches, full searches
         unsigned syncs = 0, searches = 0;
     };
@@ -1259,27 +1266,34 @@ namespace
 
     void AnimateObjects(double now)
     {
-        for (ObjRec& o : g_objects)
+        // One shared budget, not one budget per object. A single evaluation is non-preemptible.
+        const double searchDeadline = Now() + 0.001;
+        static size_t nextObject = 0;
+        const size_t first = g_objects.empty() ? 0 : nextObject % g_objects.size();
+        for (size_t visit = 0; visit < g_objects.size(); ++visit)
         {
+            const size_t objectIndex = (first + visit) % g_objects.size();
+            ObjRec& o = g_objects[objectIndex];
             if (o.parts.empty())
                 continue;
             const M2Anim* m = ObjAnim(o);
             if (!m || m->seqs.empty())
                 continue;
-            // The clock runs on.
-            if (o.timed)
-            {
-                o.ms += static_cast<float>((now - o.clockAt) * 1000.0);
+            const auto advanceClock = [&]() {
+                if (!o.timed) return;
+                const float elapsed = static_cast<float>((now - o.clockAt) * 1000.0);
                 o.clockAt = now;
-                for (int n = 0; n < 8 && o.ms > static_cast<float>(m->seqs[o.seq].end); ++n)
+                if (!AdvancePoseClock(m->seqs, o.seq, o.ms, elapsed,
+                                      [&](int q) { return NextSeq(*m, o, q); }))
                 {
-                    const float over = o.ms - static_cast<float>(m->seqs[o.seq].end);
-                    o.seq = NextSeq(*m, o, o.seq);
-                    o.ms = static_cast<float>(m->seqs[o.seq].start) + over;
-                }
-                if (o.ms > static_cast<float>(m->seqs[o.seq].end))
+                    if (o.seq < 0 || static_cast<size_t>(o.seq) >= m->seqs.size())
+                    { o.timed = false; return; }
                     o.ms = static_cast<float>(m->seqs[o.seq].start);
-            }
+                }
+            };
+            advanceClock();
+            if (o.search.Active() && (o.searchModel != m || now - o.searchAt > 5.0))
+                o.search.Cancel();
             // The pose the client drew this frame, if it drew the object.
             std::vector<ObjRec::Obs> obs;
             for (auto& kv : o.parts)
@@ -1317,8 +1331,10 @@ namespace
                     obs.push_back(ob);
                 }
             }
-            if (!obs.empty())
+            if (!obs.empty() && Now() < searchDeadline)
             {
+                nextObject = (objectIndex + 1) % g_objects.size();
+                double matchAt = now;
                 int bestSeq = -1;
                 float bestMs = 0.0f, bestErr = 1e9f;
                 const auto consider = [&](int q, float t, float e) {
@@ -1347,7 +1363,7 @@ namespace
                         for (float dir = -2.0f; dir <= 2.0f; dir += 4.0f)
                         {
                             float last = e0;
-                            for (float t = t0 + dir; t >= lo && t <= hi; t += dir)
+                            for (float t = t0 + dir; t >= lo && t <= hi && Now() < searchDeadline; t += dir)
                             {
                                 const float e = ObsError(*m, obs, o.seq, t);
                                 consider(o.seq, t, e);
@@ -1356,36 +1372,79 @@ namespace
                                 last = e;
                             }
                         }
-                        if (bestErr > kSyncErr)
-                            for (float t = lo; t <= hi; t += 2.0f)
-                                consider(o.seq, t, ObsError(*m, obs, o.seq, t));
+                        // The original 151-sample local window is resumed across frames below,
+                        // before falling back to a global search if it still finds no fit.
                     }
                 }
-                if (bestErr > kSyncErr && now - o.searchedAt > 0.5)   // everywhere, at most twice a second
+                if (bestErr <= kSyncErr)
+                    o.search.Cancel();
+                else
                 {
-                    o.searchedAt = now;
-                    ++o.searches;
-                    const bool prev = !o.prevObs.empty() && now - o.prevAt < 0.5;
-                    const float dt = static_cast<float>((now - o.prevAt) * 1000.0);
-                    bestErr = 1e9f;
-                    bestSeq = -1;
-                    const auto both = [&](int q, float t) {
-                        float e = ObsError(*m, obs, q, t);
-                        if (prev && t - dt >= static_cast<float>(m->seqs[q].start))
-                            e = 0.5f * (e + ObsError(*m, o.prevObs, q, t - dt));
-                        return e;
-                    };
-                    for (size_t q = 0; q < m->seqs.size(); ++q)
-                        for (float t = static_cast<float>(m->seqs[q].start); t <= static_cast<float>(m->seqs[q].end);
-                             t += 10.0f)
-                            consider(static_cast<int>(q), t, both(static_cast<int>(q), t));
-                    if (bestSeq >= 0)
+                    if (!o.search.Active() && now - o.searchedAt > 0.5)
                     {
-                        const int q = bestSeq;
-                        const float mid = bestMs;
-                        for (float t = mid - 10.0f; t <= mid + 10.0f; t += 1.0f)
-                            if (t >= static_cast<float>(m->seqs[q].start) && t <= static_cast<float>(m->seqs[q].end))
-                                consider(q, t, both(q, t));
+                        o.searchedAt = now;
+                        ++o.searches;
+                        o.searchAt = now;
+                        o.searchPreviousAt = o.prevAt;
+                        o.searchObs = obs;
+                        o.searchPrevObs = o.prevObs;
+                        o.searchModel = m;
+                        std::vector<PoseSearchSpan> spans;
+                        for (const auto& q : m->seqs)
+                            spans.push_back({static_cast<double>(q.start), static_cast<double>(q.end)});
+                        if (o.timed)
+                        {
+                            const auto& q = m->seqs[o.seq];
+                            o.search.BeginLocal(std::move(spans), o.seq,
+                                (std::max)(static_cast<double>(q.start), static_cast<double>(o.ms - 150.0f)),
+                                (std::min)(static_cast<double>(q.end), static_cast<double>(o.ms + 150.0f)),
+                                bestMs, bestErr, kSyncErr);
+                        }
+                        else
+                            o.search.Begin(std::move(spans));
+                    }
+                    if (o.search.Active())
+                    {
+                        const bool previous = !o.searchPrevObs.empty() && o.searchAt - o.searchPreviousAt < 0.5;
+                        const float dt = static_cast<float>((o.searchAt - o.searchPreviousAt) * 1000.0);
+                        const auto evaluate = [&](int q, float t) {
+                            float error = ObsError(*m, o.searchObs, q, t);
+                            if (!o.search.Local() && previous && t - dt >= static_cast<float>(m->seqs[q].start))
+                                error = 0.5f * (error + ObsError(*m, o.searchPrevObs, q, t - dt));
+                            return error;
+                        };
+                        const bool complete = o.search.Step(evaluate, [&]() { return Now() < searchDeadline; });
+                        if (complete && Now() < searchDeadline)
+                        {
+                            bestSeq = o.search.bestSequence;
+                            bestMs = o.search.bestTime;
+                            bestErr = o.search.bestError;
+                            matchAt = o.searchAt;
+                            // Test the candidate against today's pose before using a historical result.
+                            // Crossing a sequence boundary is handled by the same clock rule as normal playback.
+                            if (bestSeq >= 0 && bestErr <= kSyncErr)
+                            {
+                                int projectedSeq = bestSeq;
+                                float projectedMs = bestMs;
+                                const unsigned originalRng = o.rng;
+                                const bool inRange = AdvancePoseClock(m->seqs, projectedSeq, projectedMs,
+                                    static_cast<float>((now - matchAt) * 1000.0),
+                                    [&](int q) { return NextSeq(*m, o, q); });
+                                if (inRange && ObsError(*m, obs, projectedSeq, projectedMs) <= kSyncErr)
+                                {
+                                    bestSeq = projectedSeq; bestMs = projectedMs; matchAt = now;
+                                }
+                                else
+                                {
+                                    o.rng = originalRng;
+                                    bestErr = 1e9f; // rejected historical fit must not change the live clock
+                                }
+                            }
+                            if (FrameLogRunning())
+                                Log("framelog: animation search completed across frames, %u evaluations, age %.3f s, kind %d display %u model %s, error %.5f",
+                                    o.search.evaluations, now - o.searchAt, o.kind, o.display, o.model.c_str(), bestErr);
+                            o.search.Cancel();
+                        }
                     }
                 }
                 o.syncErr = bestErr;
@@ -1394,7 +1453,8 @@ namespace
                     o.timed = true;
                     o.seq = bestSeq;
                     o.ms = bestMs;
-                    o.clockAt = now;
+                    o.clockAt = matchAt;
+                    advanceClock();
                     ++o.syncs;
                 }
                 else

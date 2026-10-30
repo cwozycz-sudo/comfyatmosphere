@@ -1,3 +1,4 @@
+# Modified 2026-10-30: portable community build/tests; GNU GPL v3.
 # 32-bit only: the 1.12 client is x86, so the DLL loaded into it must be too.
 #   cmake -B build -A Win32 && cmake --build build --config Release
 cmake_minimum_required(VERSION 3.15)
@@ -54,6 +55,7 @@ add_library(comfyatmos SHARED
 # version.h: comfyatmos's version from git, for the client report (cmake/version.cmake).
 add_custom_target(comfyatmos_version
     COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/version.h
+            -DRELEASE_VERSION=${COMFYATMOS_RELEASE_VERSION}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.cmake
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/version.h)
 add_dependencies(comfyatmos comfyatmos_version)
@@ -65,7 +67,7 @@ target_include_directories(comfyatmos PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 set_target_properties(comfyatmos PROPERTIES
     OUTPUT_NAME "comfyatmos"
     PREFIX ""
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}$<0:>")
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/$<CONFIG>")
 
 if(MSVC)
     target_compile_options(comfyatmos PRIVATE /W3 /permissive- /GS-)
@@ -93,4 +95,34 @@ if(COMFY_MEMTRACE)
     target_compile_options(comfyatmos PRIVATE /Zi /Oy-)
     target_link_options(comfyatmos PRIVATE /DEBUG /OPT:REF /OPT:ICF)
     set_target_properties(comfyatmos PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}$<0:>")
+endif()
+
+# All community test sources are included in this repository.
+option(COMFY_BUILD_PERFORMANCE_TESTS "Build CPU-only cache and search regressions" OFF)
+option(COMFY_BUILD_GPU_TESTS "Build standalone Windows D3D9/DXVK regressions" OFF)
+function(comfy_assertions target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(${target} PRIVATE -UNDEBUG)
+    endif()
+endfunction()
+if(COMFY_BUILD_PERFORMANCE_TESTS)
+    enable_testing()
+    add_executable(mist_cache_test tests/performance/test-mist.cpp)
+    add_executable(pose_search_test tests/performance/test-pose-search.cpp)
+    target_include_directories(pose_search_test PRIVATE src)
+    foreach(target mist_cache_test pose_search_test)
+        comfy_assertions(${target})
+        add_test(NAME ${target} COMMAND ${target})
+    endforeach()
+endif()
+if(COMFY_BUILD_GPU_TESTS)
+    if(NOT WIN32)
+        message(FATAL_ERROR "GPU regressions require Windows and D3D9/DXVK")
+    endif()
+    add_executable(mist_dxvk_test tests/performance/test-mist-dxvk.cpp)
+    add_executable(liquid_dxvk_test tests/performance/test-liquid-dxvk.cpp)
+    comfy_assertions(mist_dxvk_test)
+    comfy_assertions(liquid_dxvk_test)
 endif()

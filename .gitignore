@@ -7,3 +7,10 @@ tests/Publish-Results.ps1
 CLAUDE.md
 reddit.md
 discord.md
+
+# Community build outputs
+build-community/
+build-public/
+dist/
+*.pdb
+*.obj

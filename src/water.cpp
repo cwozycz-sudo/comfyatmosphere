@@ -1,3 +1,5 @@
+// Modified 2026-10-30 by cwozycz-sudo: Use resource-owned building-liquid classification.
+// Community changes distributed under the upstream GNU GPL v3; see LICENSE.
 // water: foam where the water is shallow.
 //
 // The client draws rivers, lakes and the sea as a run of fixed-function chunks through its water pixel shader
@@ -5165,7 +5167,9 @@ void WaterFrameEnd(IDirect3DDevice9* dev)
 namespace
 {
     // Liquid textures already judged (WaterTextureIsWater). Cleared with the device.
-    std::map<IDirect3DBaseTexture9*, bool> g_liquidTex;
+    constexpr GUID kLiquidClassification = {0xf2941a63, 0x40f7, 0x42cc, {0xa1,0x37,0xf6,0x24,0x56,0x61,0x9c,0xc0}};
+    uint64_t g_liquidEpoch = 1;
+    struct LiquidClassification { uint64_t epoch; BOOL water; };
 
     float Unpack565(uint16_t c, int ch)
     {
@@ -5225,11 +5229,20 @@ bool WaterTextureIsWater(IDirect3DDevice9* dev)
     IDirect3DBaseTexture9* base = nullptr;
     if (FAILED(dev->lpVtbl->GetTexture(dev, 0, &base)) || !base)
         return false;
-    auto it = g_liquidTex.find(base);
-    if (it != g_liquidTex.end())
+    LiquidClassification result = {};
+    DWORD resultSize = sizeof(result);
+    if (SUCCEEDED(base->lpVtbl->GetPrivateData(base, kLiquidClassification, &result, &resultSize)) &&
+        resultSize == sizeof(result) && result.epoch == g_liquidEpoch)
     {
         base->lpVtbl->Release(base);
-        return it->second;
+        return result.water != FALSE;
+    }
+    result.epoch = g_liquidEpoch;
+    result.water = FALSE;
+    if (FAILED(base->lpVtbl->SetPrivateData(base, kLiquidClassification, &result, sizeof(result), 0)))
+    {
+        base->lpVtbl->Release(base);
+        return false;
     }
     bool water = false;
     float rgb[3] = {};
@@ -5242,8 +5255,9 @@ bool WaterTextureIsWater(IDirect3DDevice9* dev)
     }
     else
         Log("water: a building's liquid, texture %p: its colour could not be read, left to the game", base);
-    if (g_liquidTex.size() < 512)
-        g_liquidTex[base] = water;
+    result.water = water ? TRUE : FALSE;
+    if (FAILED(base->lpVtbl->SetPrivateData(base, kLiquidClassification, &result, sizeof(result), 0)))
+        water = false;
     base->lpVtbl->Release(base);
     return water;
 }
@@ -5253,7 +5267,7 @@ void WaterReset()
     for (PendingChunk& p : g_pending)
         ReleasePending(p);
     g_pending.clear();
-    g_liquidTex.clear();
+    ++g_liquidEpoch;
     g_trails.clear();
     g_hulls.clear();
     g_hullRelN = 0;

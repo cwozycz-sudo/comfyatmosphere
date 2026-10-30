@@ -1,3 +1,5 @@
+// Modified 2026-10-30 by cwozycz-sudo: Report per-frame shadow stage timings.
+// Community changes distributed under the upstream GNU GPL v3; see LICENSE.
 // bench: what each feature costs, measured in the running client.
 //
 // Alt + the probe key (Alt+F12) runs three steps, one after the other: sun rays and volumetric light; sun
@@ -612,10 +614,12 @@ namespace
     {
         double at, ms, record, cache, replay;
         unsigned added, evicted, copies, entries;
+        unsigned long long prof[kProfCount] = {};
     };
     double                g_flStart = 0.0, g_flLength = 0.0;
     std::vector<FrameRow> g_flRows;
     unsigned              g_flCopies = 0;
+    unsigned long long    g_flPreviousProf[kProfCount] = {};
 
     void FrameLogReport()
     {
@@ -725,6 +729,15 @@ namespace
             Log("framelog:   %6.2f ms at %5.2f s; ours %.2f (recording %.2f, cache %.2f, replay %.2f); %u added, "
                 "%u evicted, %u copies, %u entries", r.ms, r.at, r.record + r.cache + r.replay, r.record, r.cache,
                 r.replay, r.added, r.evicted, r.copies, r.entries);
+            std::string split;
+            const double tickMs = 1000.0 * TickSecs();
+            for (int p = 0; p < kProfCount; ++p)
+            {
+                char part[96];
+                _snprintf_s(part, sizeof(part), _TRUNCATE, "%s%s %.3f", p ? "; " : "", kProfNames[p], r.prof[p] * tickMs);
+                split += part;
+            }
+            Log("framelog: slow-frame CPU split at %.2f s, ms: %s", r.at, split.c_str());
         }
         Log("framelog: done");
     }
@@ -749,6 +762,8 @@ void FrameLogStart(double seconds)
     for (unsigned long long& t : g_flParts)
         t = 0;
     for (unsigned long long& t : g_flProf)
+        t = 0;
+    for (unsigned long long& t : g_flPreviousProf)
         t = 0;
     ShadowTiming(true);
     double r, c, p;
@@ -776,6 +791,11 @@ void FrameLogFrame(double frameSeconds)
     row.evicted = counts[2] + counts[3] + counts[4];
     unsigned failed = 0;
     const unsigned copies = ShadowCopies(failed);
+    for (int p = 0; p < kProfCount; ++p)
+    {
+        row.prof[p] = g_flProf[p] >= g_flPreviousProf[p] ? g_flProf[p] - g_flPreviousProf[p] : 0;
+        g_flPreviousProf[p] = g_flProf[p];
+    }
     row.copies = copies > g_flCopies ? copies - g_flCopies : 0;
     g_flCopies = copies;
     g_flRows.push_back(row);

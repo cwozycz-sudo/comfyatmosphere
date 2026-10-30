@@ -1,3 +1,11 @@
+> **Unofficial community maintenance branch / 非官方社区修复分支**
+> Original project and author: [aloofbit/comfyatmosphere](https://github.com/aloofbit/comfyatmosphere).
+> GNU GPL v3; original notices are retained. [Attribution/change notice](NOTICE.community.md).
+> [Community installation, source build and limitations](COMMUNITY.md) · [中文说明](COMMUNITY.zh-CN.md).
+> This is not an official upstream release. Original project README follows below.
+
+---
+
 # Comfy Atmosphere
 
 > **Bugs, questions and screenshots. Ty for testing!: [join our Discord](https://discord.gg/uhefX2efB7).**
@@ -153,7 +161,7 @@ cmake -B build -A Win32
 cmake --build build --config Release
 ```
 
-`comfyatmos.dll` is written to the project root, next to `comfyatmos.ini`.
+On this community branch, `comfyatmos.dll` is written to `build/artifacts/Release` (or the build directory you selected).
 
 ## Licence
 

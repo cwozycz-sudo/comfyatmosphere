@@ -1,3 +1,5 @@
+// Modified 2026-10-30 by cwozycz-sudo: Use resource-owned rain texture classification and cap diagnostic logs.
+// Community changes distributed under the upstream GNU GPL v3; see LICENSE.
 // comfyatmos: the atmosphere effects for the 1.12 client.
 //
 // Same shape as comfygrass: loaded by VanillaFixes from dlls.txt, attaches by patching DXVK's shared
@@ -85,18 +87,50 @@ namespace
 
 void Log(const char* fmt, ...)
 {
-    if (!g_cfg.logEnabled)
-        return;
-    Guard g;
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, g_logPath, L"a") != 0 || !f)
-        return;
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
+    if (!g_cfg.logEnabled || !g_logPath[0]) return;
+    // Bound individual messages and disk usage, including multi-client use.
+    constexpr LONGLONG limit = 5LL * 1024 * 1024;
+    char line[8192];
+    va_list ap; va_start(ap, fmt);
+    int length = _vsnprintf_s(line, sizeof(line) - 1, _TRUNCATE, fmt, ap);
     va_end(ap);
-    fputc('\n', f);
-    fclose(f);
+    if (length < 0) length = static_cast<int>(strlen(line));
+    line[length++] = '\n';
+    Guard guard;
+    // Do not wait for another client or a locked log: logging must not block gameplay.
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        HANDLE file = CreateFileW(g_logPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+                                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER size = {};
+        if (!GetFileSizeEx(file, &size)) { CloseHandle(file); return; }
+        // A legacy oversized log is discarded, never moved into an oversized backup.
+        if (size.QuadPart > limit)
+        {
+            LARGE_INTEGER zero = {};
+            if (!SetFilePointerEx(file, zero, nullptr, FILE_BEGIN) || !SetEndOfFile(file))
+            { CloseHandle(file); return; }
+            size.QuadPart = 0;
+        }
+        if (size.QuadPart + length > limit)
+        {
+            CloseHandle(file);
+            wchar_t previous[MAX_PATH + 16];
+            if (_snwprintf_s(previous, _countof(previous), _TRUNCATE, L"%ls.previous", g_logPath) < 0)
+                return;
+            if (!MoveFileExW(g_logPath, previous, MOVEFILE_REPLACE_EXISTING)) return;
+            continue;
+        }
+        LARGE_INTEGER zero = {};
+        if (SetFilePointerEx(file, zero, nullptr, FILE_END))
+        {
+            DWORD written = 0;
+            WriteFile(file, line, static_cast<DWORD>(length), &written, nullptr);
+        }
+        CloseHandle(file);
+        return;
+    }
 }
 
 double Now()
@@ -2491,7 +2525,10 @@ namespace
     constexpr const char* kMistTexName = "textures\\Weather\\SnowMist01.blp";
     std::vector<uint8_t> g_mistTop;                           // the file's top level, as a D3D texture holds it
     int                  g_mistState = 0;                     // 0 not read yet, 1 read, -1 could not be read
-    std::unordered_map<const void*, bool> g_mistTex;          // textures compared: whether each is the mist
+    // Resource-owned classification follows texture lifetime, including pointer reuse.
+    constexpr GUID kMistClassification = {0x6fa5e242, 0x9762, 0x4277, {0xa7,0x67,0xf0,0x2c,0x9b,0x35,0x18,0x46}};
+    uint64_t g_mistEpoch = 1;
+    struct MistClassification { uint64_t epoch; BOOL same; };
 
     bool MistFileReady()
     {
@@ -2522,7 +2559,11 @@ namespace
     constexpr const char* kSplashTexName = "textures\\Weather\\RainDropSplash01.blp";
     std::vector<uint8_t> g_splashTop;                         // the file's top level, BGRA
     int                  g_splashState = 0;                   // 0 not read yet, 1 read, -1 could not be read
-    std::unordered_map<const void*, bool> g_splashTex;        // textures compared: whether each is the splash
+    // Keep classification on the resource, not in a pointer table that stops accepting
+    // entries after 256 textures. Private data disappears with the D3D resource.
+    constexpr GUID kSplashClassification = {0x71d871aa, 0x673f, 0x4f7a, {0xa4,0xf5,0x87,0x35,0xd3,0x90,0x51,0x23}};
+    uint64_t g_splashEpoch = 1;
+    struct SplashClassification { uint64_t epoch; BOOL same; };
 
     void SplashFileReady()
     {
@@ -2546,9 +2587,17 @@ namespace
 
     bool IsSplashTexture(IDirect3DTexture9* t)
     {
-        const auto it = g_splashTex.find(t);
-        if (it != g_splashTex.end())
-            return it->second;
+        SplashClassification result = {};
+        DWORD resultSize = sizeof(result);
+        if (SUCCEEDED(t->lpVtbl->GetPrivateData(t, kSplashClassification, &result, &resultSize)) &&
+            resultSize == sizeof(result) && result.epoch == g_splashEpoch)
+            return result.same != FALSE;
+        // Reserve a negative classification first. If resource-private storage fails,
+        // preserve the original rain draw instead of repeatedly scanning on the render thread.
+        result.epoch = g_splashEpoch;
+        result.same = FALSE;
+        if (FAILED(t->lpVtbl->SetPrivateData(t, kSplashClassification, &result, sizeof(result), 0)))
+            return false;
         bool same = false;
         D3DSURFACE_DESC desc = {};
         D3DLOCKED_RECT lr = {};
@@ -2574,11 +2623,16 @@ namespace
             }
             t->lpVtbl->UnlockRect(t, 0);
             same = match >= 256u * 256u * 98u / 100u;
-            Log("water: texture %p, 256x256 A4R4G4B4: %u of 65536 texels as the rain splash's: %s", t, match,
+            if (g_probe.active)
+                Log("water: texture %p, 256x256 A4R4G4B4: %u of 65536 texels as the rain splash's: %s", t, match,
                 same ? "the splash, left out under the water" : "not the splash");
         }
-        if (g_splashTex.size() < 256)
-            g_splashTex[t] = same;
+        if (same) {
+            result.same = TRUE;
+            // On write failure retain the negative result; never suppress an unconfirmed draw.
+            if (FAILED(t->lpVtbl->SetPrivateData(t, kSplashClassification, &result, sizeof(result), 0)))
+                return false;
+        }
         return same;
     }
 
@@ -2622,16 +2676,23 @@ namespace
     // A new device or a Reset: the textures compared may be gone, and their addresses taken by others.
     void ForgetMistTextures()
     {
-        g_mistTex.clear();
-        g_splashTex.clear();
+        ++g_mistEpoch;
+        ++g_splashEpoch; // invalidate surviving managed resources after reset
     }
 
     // Whether the texture is the mist: its top level against the file's, once for each texture.
     bool IsMistTexture(IDirect3DTexture9* t)
     {
-        const auto it = g_mistTex.find(t);
-        if (it != g_mistTex.end())
-            return it->second;
+        MistClassification result = {};
+        DWORD resultSize = sizeof(result);
+        if (SUCCEEDED(t->lpVtbl->GetPrivateData(t, kMistClassification, &result, &resultSize)) &&
+            resultSize == sizeof(result) && result.epoch == g_mistEpoch)
+            return result.same != FALSE;
+        result.epoch = g_mistEpoch;
+        result.same = FALSE;
+        // If storage fails, keep the original draw without a GPU readback loop.
+        if (FAILED(t->lpVtbl->SetPrivateData(t, kMistClassification, &result, sizeof(result), 0)))
+            return false;
         bool same = false;
         D3DSURFACE_DESC desc = {};
         if (SUCCEEDED(t->lpVtbl->GetLevelDesc(t, 0, &desc)) &&
@@ -2649,8 +2710,9 @@ namespace
                 t->lpVtbl->UnlockRect(t, 0);
             }
         }
-        if (g_mistTex.size() < 256)
-            g_mistTex[t] = same;
+        result.same = same ? TRUE : FALSE;
+        if (FAILED(t->lpVtbl->SetPrivateData(t, kMistClassification, &result, sizeof(result), 0)))
+            return false;
         if (same)
             Log("sky: texture %p is the rain mist (SnowMist01.blp): left out in every frame", t);
         return same;
@@ -3589,7 +3651,7 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID)
             wcscpy_s(logName, MAX_PATH - (logName - g_logPath), L"Logs\\comfyatmos.log");
         else
             wcscpy_s(logName, MAX_PATH - (logName - g_logPath), L"comfyatmos.log");
-        DeleteFileW(g_logPath);
+        // Log() rotates and bounds the existing log; do not clear another client's history.
         // A copy loaded by the hot reload: what /atmos set in the last copy, laid over the ini as it was there.
         const std::string handed = HotTake("comfyatmos.overrides");
         for (size_t at = 0; at < handed.size();)
